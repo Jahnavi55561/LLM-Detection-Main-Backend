@@ -1,105 +1,97 @@
 
-    response_payload = {
-        "results": results,
-        "analysis": results,
-        "counts": counts,
-        "summary": counts,
-        "corrected_paragraph": corrected_paragraph,
-        "total_sentences": len(results),
-        "supported_count": counts["Supported"],
-        "contradicted_count": counts["Contradicted"],
-        "unverified_count": counts["Unverified"],
-    }
 
-    preview = text[:80] + ("…" if len(text) > 80 else "")
-    RECENT_HISTORY.appendleft({
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "preview": preview,
-        "total_sentences": len(results),
-        "counts": counts,
-        "corrected_paragraph": corrected_paragraph,
-    })
+from flask import Flask, render_template, request, jsonify
+from datetime import datetime, timezone
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+import re
+from flask_cors import CORS
 
-    return jsonify(response_payload)
+from services.evidence import retrieve_evidence
+from services.verification import verify_claim, model_status
+from services.correction import (
+    suggest_correction,
+    validate_correction,
+    build_corrected_paragraph,
+)
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("app")
 
-@app.post("/api/chat")
-def chat():
-    data = request.get_json(silent=True) or {}
-    question = (data.get("message") or "").strip()
+app = Flask(__name__)
 
-    if not question:
-        return jsonify({
-            "reply": "Ask a factual question or statement to verify."
-        })
+# ============================================================
+# CORS CONFIGURATION
+# Allow the deployed Vercel frontend to call this Render API.
+# No cookies/credentials are used by this application.
+# ============================================================
 
-    curated = lookup_curated_claim(question)
-    if curated:
-        explanation = curated["evidence"]
-        reply = f"Claim status: {curated['status']}. {explanation}"
+FRONTEND_ORIGIN = "https://llm-detection-main-frontend.vercel.app"
 
-        if curated["correction"]:
-            reply += f" Correct answer: {curated['correction']}"
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            # Keep "*" while debugging deployment CORS so Vercel
+            # requests and browser OPTIONS preflight are not blocked.
+            "origins": "*",
+            "methods": ["GET", "POST", "DELETE", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization"],
+            "max_age": 600,
+        }
+    },
+    supports_credentials=False,
+    always_send=True,
+    vary_header=True,
+)
 
-        return jsonify({
-            "status": curated["status"],
-            "confidence": 0.99,
-            "explanation": explanation,
-            "evidence": curated["evidence"],
-            "source": "Built-in curated reference facts",
-            "correction": curated["correction"],
-            "domain": curated["domain"],
-            "reply": reply,
-        })
-
-    try:
-        evidence = retrieve_evidence(question)
-
-        if evidence.get("evidence"):
-            verification = verify_claim(question, evidence)
-            source = evidence.get("source") or "Reference source"
-            explanation = verification.get("explanation") or ""
-            reply = (
-                f"Claim status: {verification.get('status')}. "
-                f"{explanation} Source: {source}."
-            )
-
-            return jsonify({
-                "status": verification.get("status", "Unverified"),
-                "confidence": verification.get("confidence", 0.0),
-                "explanation": explanation,
-                "source": source,
-                "reply": reply,
-            })
-
-    except Exception:
-        logger.exception("Chat verification failed")
-
-    return jsonify({
-        "status": "Unverified",
-        "confidence": 0.0,
-        "reply": (
-            "No definitive source evidence was found for that query. "
-            "Please try a more specific factual claim."
-        ),
-    })
+@app.after_request
+def add_cors_headers(response):
+    # Explicit fallback for API responses, including error responses.
+    # This also helps make CORS behavior consistent across Render workers.
+    if request.path.startswith("/api/"):
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Max-Age"] = "600"
+    return response
 
 
-@app.get("/api/history")
-def history():
-    return jsonify({"history": list(RECENT_HISTORY)})
+RECENT_HISTORY = deque(maxlen=20)
 
+# ============================================================
+# 30 CURATED CLAIMS: 15 SUPPORTED + 15 CONTRADICTED
+# ============================================================
 
-@app.post("/api/history/clear")
-@app.delete("/api/history")
-def clear_history():
-    RECENT_HISTORY.clear()
-    return jsonify({
-        "ok": True,
-        "message": "History cleared successfully."
-    })
-
-
-if __name__ == "__main__":
-    # Local development only. Render should use its configured start command.
-    app.run(host="127.0.0.1", port=5000, debug=False)
+CURATED_FACTS = [
+    {
+        "claims": ["The capital of Australia is Canberra."],
+        "status": "Supported",
+        "evidence": "Canberra is the capital city of Australia.",
+        "correction": "",
+        "domain": "Geography",
+    },
+    {
+        "claims": ["The Earth revolves around the Sun."],
+        "status": "Supported",
+        "evidence": "Earth orbits the Sun once approximately every 365.25 days.",
+        "correction": "",
+        "domain": "Astronomy",
+    },
+    {
+        "claims": ["IPv4 addresses are 32 bits long."],
+        "status": "Supported",
+        "evidence": "An IPv4 address contains 32 bits, commonly written as four decimal octets.",
+        "correction": "",
+        "domain": "Computer Networks",
+    },
+    {
+        "claims": ["The human heart has four chambers."],
+        "status": "Supported",
+        "evidence": "The human heart has four chambers: two atria and two ventricles.",
+        "correction": "",
+        "domain": "Biology",
