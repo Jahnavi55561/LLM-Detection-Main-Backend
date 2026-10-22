@@ -404,7 +404,13 @@ def _process_single_sentence(idx: int, sentence: str) -> dict:
 
 @app.get("/")
 def index():
-    return render_template("index.html")
+    return jsonify({
+        "ok": True,
+        "message": "LLM Detection Backend is running",
+        "health": "/api/health",
+        "analyze": "/api/analyze",
+        "chat": "/api/chat"
+    })
 
 
 @app.get("/api/health")
